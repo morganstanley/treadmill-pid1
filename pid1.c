@@ -3,6 +3,8 @@
  * author: Charles-Henri.de.Boysson@morganstanley.com
  */
 
+#define _GNU_SOURCE
+
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
