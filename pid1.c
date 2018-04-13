@@ -9,7 +9,6 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/signalfd.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
@@ -30,6 +29,18 @@ extern int optind;
 
 #define ERR_EXIT(...)                                              \
     _err_exit(__FILE__, __LINE__, errno, __VA_ARGS__)
+
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
+#define UNSHARE_PROPAGATION_DEFAULT (MS_REC | MS_SHARED)
+
+enum {
+    OPT_PROPAGATION
+};
+
+struct unshare_param {
+    int unshare_flags;
+    unsigned long propagation;
+};
 
 static inline
 void _err_exit(const char *file, const int line,
@@ -187,6 +198,18 @@ void wait_for_exit(int sfd, pid_t pid1)
     }
 }
 
+/* Setup mount a private / mount point (required by redhat 7)
+ */
+static
+void set_propagation(unsigned long flags)
+{
+    if (flags == 0)
+        return;
+
+    if (mount("none", "/", NULL, flags, NULL) != 0)
+        ERR_EXIT("cannot change root filesystem propagation");
+}
+
 /* Setup a private /proc mount point in the new mount namespace.
  */
 static inline
@@ -210,7 +233,7 @@ void mount_proc(void)
 /* Setup a new environment of the child process and exec it.
  */
 static
-void exec_pid1(char *argv[], int unshare_flags)
+void exec_pid1(char *argv[], struct unshare_param exec_param)
 {
     int rc;
 
@@ -221,9 +244,10 @@ void exec_pid1(char *argv[], int unshare_flags)
     if (rc != 0)
         ERR_EXIT("prctl");
 
-    if (unshare_flags & CLONE_NEWNS) {
+    if (exec_param.unshare_flags & CLONE_NEWNS) {
         /* Make sure the new PID/IPC namespace has its own private proc.
          */
+        set_propagation(exec_param.propagation);
         mount_proc();
     }
 
@@ -245,12 +269,12 @@ void exec_pid1(char *argv[], int unshare_flags)
  *  of being re-parented to pid 1.
  */
 static
-pid_t start_link(char *argv[], int unshare_flags)
+pid_t start_link(char *argv[], struct unshare_param exec_param)
 {
     pid_t pid1;
     int rc;
 
-    rc = unshare(unshare_flags);
+    rc = unshare(exec_param.unshare_flags);
     if (rc != 0)
         ERR_EXIT("unshare");
 
@@ -261,7 +285,7 @@ pid_t start_link(char *argv[], int unshare_flags)
     else if (pid1 ==  0)
     {
         /* child. exec into the pid1 process */
-        exec_pid1(argv, unshare_flags);
+        exec_pid1(argv, exec_param);
         /* Never reached */
         exit(EXIT_FAILURE);
     }
@@ -288,6 +312,8 @@ void usage(int exit_status)
        "  -m, --mount           unshare mounts namespace\n"
        "  -i, --ipc             unshare IPC namespace\n"
        "  -p, --pid             unshare PID namespace\n"
+       "  ---propagation slave|shared|private|unchanged\n"
+       "                        propagation mode, default shared\n"
     );
     fflush(out);
 
@@ -295,28 +321,56 @@ void usage(int exit_status)
 }
 
 static
-int parse_opts(int argc, char *argv[])
+unsigned long parse_propagation(const char *str)
+{
+    size_t i;
+    static const struct prop_opts {
+        const char *name;
+        unsigned long flag;
+    } opts[] = {
+        { "slave",  MS_REC | MS_SLAVE },
+        { "private",    MS_REC | MS_PRIVATE },
+        { "shared",     MS_REC | MS_SHARED },
+        { "unchanged",        0 }
+    };
+
+    for (i = 0; i < ARRAY_SIZE(opts); i++) {
+        if (strcmp(opts[i].name, str) == 0)
+        return opts[i].flag;
+    }
+    fprintf(stderr, "unsupported propagation mode: %s", str);
+    usage(EXIT_FAILURE);
+    /* should not reach here */
+    return 0;
+}
+
+static
+struct unshare_param parse_opts(int argc, char *argv[])
 {
     static const struct option longopts[] = {
         { "help", no_argument, 0, 'h' },
         { "ipc",   no_argument, 0, 'i' },
         { "mount",   no_argument, 0, 'm' },
         { "pid",   no_argument, 0, 'p' },
+        { "propagation", required_argument, 0, OPT_PROPAGATION },
         { NULL, 0, 0, 0 }
     };
     int c;
-    int unshare_flags = 0;
+    struct unshare_param param = {0, UNSHARE_PROPAGATION_DEFAULT};
 
     while ((c = getopt_long(argc, argv, "+himp", longopts, NULL)) != -1) {
         switch (c) {
             case 'i':
-                unshare_flags |= CLONE_NEWIPC;
+                param.unshare_flags |= CLONE_NEWIPC;
                 break;
             case 'p':
-                unshare_flags |= CLONE_NEWPID;
+                param.unshare_flags |= CLONE_NEWPID;
                 break;
             case 'm':
-                unshare_flags |= CLONE_NEWNS;
+                param.unshare_flags |= CLONE_NEWNS;
+                break;
+            case OPT_PROPAGATION:
+                param.propagation = parse_propagation(optarg);
                 break;
             case 'h':
                 usage(EXIT_SUCCESS);
@@ -325,19 +379,22 @@ int parse_opts(int argc, char *argv[])
                 usage(EXIT_FAILURE);
         }
     }
-
-    return unshare_flags;
+    return param;
 }
 
 int main(int argc, char *argv[])
 {
-    int unshare_flags;
     int child_cmd_index = 0;
     int sfd;
     pid_t pid1;
 
-    unshare_flags = parse_opts(argc, argv);
+    struct unshare_param exec_param = parse_opts(argc, argv);
     child_cmd_index = optind;
+
+    /* Must have program name in parameter */
+    if (child_cmd_index == argc) {
+        usage(EXIT_FAILURE);
+    }
 
     fprintf(stderr, "started parent pid: %ld\n", (long) getpid());
 
@@ -345,10 +402,11 @@ int main(int argc, char *argv[])
     block_all_signals();
     sfd = init_signalfd();
 
-    pid1 = start_link(&argv[child_cmd_index], unshare_flags);
+    pid1 = start_link(&argv[child_cmd_index], exec_param);
 
     wait_for_exit(sfd, pid1);
 
     /* Never reached */
     exit(EXIT_FAILURE);
 }
+
