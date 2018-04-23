@@ -1,7 +1,5 @@
-%define         _topdir        TOPDIR
-
 Name:           pid1
-Version:        VERSION
+Version:        2.3
 Release:        2%{?dist}
 Summary:        Treadmill pid1 utility.
 
