@@ -22,7 +22,7 @@ rpm: dist
            -D "_topdir $(rpmdir)" \
 		   -D "_version $${REPO_VER:=0.0}" \
 		   -D "_release $${REPO_REL:=$(REPO_COMMITS)}" \
-           $(top_srcdir)/pid1.spec
+           $(top_srcdir)/treadmill-pid1.spec
 
 install_rpm:
 	[ ! -z $(rpm_install_dir) ] || echo must run make rpm_install_dir=...
