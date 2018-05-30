@@ -1,6 +1,6 @@
 Name:           pid1
-Version:        2.3
-Release:        2%{?dist}
+Version:        %{_version} 
+Release:        %{_release}%{?dist}
 Summary:        Treadmill pid1 utility.
 
 License:        Apache 2.0
