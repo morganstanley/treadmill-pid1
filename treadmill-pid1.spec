@@ -1,4 +1,4 @@
-Name:           pid1
+Name:           treadmill-pid1
 Version:        %{_version} 
 Release:        %{_release}%{?dist}
 Summary:        Treadmill pid1 utility.
