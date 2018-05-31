@@ -1,7 +1,7 @@
 ACLOCAL_AMFLAGS = -I m4
 SUBDIRS = src
 EXTRA_DIST = autogen.sh
-REPO_TAG=$(shell git describe --tags --match "v*" 2>/dev/null | cut -b 2-)
+REPO_TAG=$(shell git describe --tags --long --match "v*" 2>/dev/null | cut -b 2-)
 REPO_TAGFMT=$(shell echo ${REPO_TAG} | sed 's/-g/-/')
 REPO_VER=$(shell echo ${REPO_TAGFMT} | cut -d '-' -f 1)
 REPO_REL=$(shell echo ${REPO_TAGFMT} | cut -d '-' -f 2,3 | sed 's/-/_/')
