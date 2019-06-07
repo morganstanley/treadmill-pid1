@@ -11,8 +11,10 @@
 #include <sys/signalfd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
+#include <limits.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -32,6 +34,7 @@ extern int optind;
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 #define UNSHARE_PROPAGATION_DEFAULT (MS_REC | MS_SHARED)
+#define CLOSE_FROM_DEFAULT (-1)
 
 enum {
     OPT_PROPAGATION
@@ -40,6 +43,7 @@ enum {
 struct unshare_param {
     int unshare_flags;
     unsigned long propagation;
+    long closefrom_fd;
 };
 
 static inline
@@ -49,10 +53,11 @@ void _err_exit(const char *file, const int line,
     const char *errmsg = strerror(err);
     va_list ap;
 
+    fprintf(stderr, "%s:%d: ", file, line);
     va_start(ap, msg);
-    fprintf(stderr, "%s:%d: %s(%d): ", file, line, errmsg, err);
     vfprintf(stderr, msg, ap);
     va_end(ap);
+    fprintf(stderr, ": %s (errno:%d)\n", errmsg, err);
 
     /* Die in a fire */
     raise(SIGABRT);
@@ -103,6 +108,84 @@ void unblock_all_signals(void)
     rc = sigprocmask(SIG_SETMASK, &set, NULL);
     if (rc != 0)
         ERR_EXIT("sigprocmask");
+}
+
+/* Parse a fd number str */
+static inline
+long parse_fd(const char *str)
+{
+    long val;
+    char *endptr;
+
+    errno = 0;    /* To distinguish success/failure after call */
+    val = strtol(str, &endptr, 10);
+
+    if ((errno == ERANGE && (val == LONG_MAX || val == LONG_MIN)) ||
+        (errno != 0 && val == 0))
+    {
+        ERR_EXIT("strtol");
+    }
+    if (*endptr != '\0')
+    {
+        fprintf(stderr, "Invalid filedescriptor number: '%s'\n", str);
+        exit(EXIT_FAILURE);
+    }
+
+    return val;
+}
+
+/* Close all FDs from and including `low_fd`.
+ * Any errors encountered  while closing file descriptors are ignored.
+ *
+ * This will try to be clever and use /proc/self/fd and fallback to calling
+ * close on all possible FDs otherwise.
+ */
+static inline
+void closefrom(int low_fd)
+{
+    DIR *fds_dir;
+
+    fds_dir = opendir("/proc/self/fd");
+    if (fds_dir == NULL)
+    {
+        /* The slow way */
+        long max_fd;
+
+        max_fd = sysconf(_SC_OPEN_MAX);
+        if (max_fd < 0)
+            ERR_EXIT("sysconf");
+
+        for (long i = low_fd; i < max_fd; i++)
+            close(i);
+    }
+    else
+    {
+        struct dirent *cur;
+        int fds_fd = dirfd(fds_dir);
+
+        errno = 0;    /* To distinguish success/failure after call */
+        cur = readdir(fds_dir);
+        for (; cur != NULL; cur = readdir(fds_dir))
+        {
+            int cur_fd;
+
+            if (errno != 0)
+                ERR_EXIT("readdir");
+            if (!(cur->d_type & DT_LNK))
+                continue;
+
+            cur_fd = parse_fd(cur->d_name);
+            if (cur_fd < low_fd)
+                continue;
+            if (cur_fd == fds_fd)
+                /* Do not close our current dir handle */
+                continue;
+            close(cur_fd);
+
+            errno = 0;    /* To distinguish success/failure after call */
+        }
+        closedir(fds_dir);
+    }
 }
 
 /* Setup a signalfd socket that will receive all signal events.
@@ -251,6 +334,11 @@ void exec_pid1(char *argv[], struct unshare_param exec_param)
         mount_proc();
     }
 
+    /* Optionally clean up all FDs
+     */
+    if (exec_param.closefrom_fd >= 0)
+        closefrom(exec_param.closefrom_fd);
+
     /* unblock all signals.
      */
     unblock_all_signals();
@@ -314,6 +402,8 @@ void usage(int exit_status)
        "  -p, --pid             unshare PID namespace\n"
        "  ---propagation slave|shared|private|unchanged\n"
        "                        propagation mode, default shared\n"
+       "  -c, --closefrom FD    Close all filedescriptors from and\n"
+       "                        including FD\n"
     );
     fflush(out);
 
@@ -344,21 +434,27 @@ unsigned long parse_propagation(const char *str)
     return 0;
 }
 
+
 static
 struct unshare_param parse_opts(int argc, char *argv[])
 {
     static const struct option longopts[] = {
-        { "help", no_argument, 0, 'h' },
-        { "ipc",   no_argument, 0, 'i' },
-        { "mount",   no_argument, 0, 'm' },
-        { "pid",   no_argument, 0, 'p' },
-        { "propagation", required_argument, 0, OPT_PROPAGATION },
-        { NULL, 0, 0, 0 }
+        { "help", no_argument, NULL, 'h' },
+        { "ipc",   no_argument, NULL, 'i' },
+        { "mount",   no_argument, NULL, 'm' },
+        { "pid",   no_argument, NULL, 'p' },
+        { "propagation", required_argument, NULL, OPT_PROPAGATION },
+        { "closefrom", required_argument, NULL, 'c' },
+        { NULL, 0, NULL, '\0' }
     };
     int c;
-    struct unshare_param param = {0, UNSHARE_PROPAGATION_DEFAULT};
+    struct unshare_param param = {
+        0,
+        UNSHARE_PROPAGATION_DEFAULT,
+        CLOSE_FROM_DEFAULT
+    };
 
-    while ((c = getopt_long(argc, argv, "+himp", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "+himpc:", longopts, NULL)) != -1) {
         switch (c) {
             case 'i':
                 param.unshare_flags |= CLONE_NEWIPC;
@@ -368,6 +464,9 @@ struct unshare_param parse_opts(int argc, char *argv[])
                 break;
             case 'm':
                 param.unshare_flags |= CLONE_NEWNS;
+                break;
+            case 'c':
+                param.closefrom_fd = parse_fd(optarg);
                 break;
             case OPT_PROPAGATION:
                 param.propagation = parse_propagation(optarg);
